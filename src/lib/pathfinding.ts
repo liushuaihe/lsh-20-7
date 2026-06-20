@@ -13,7 +13,6 @@ import {
   stations as allStations,
   metroLines,
   getStationById,
-  getLineById,
   getTransferChannel,
   fareConfig,
   getLineTimetable,
@@ -21,6 +20,7 @@ import {
 } from '@/data/metroNetwork';
 import {
   timeStringToMinutes,
+  minutesToTimeString,
 } from '@/lib/utils';
 
 interface GraphNode {
@@ -392,13 +392,15 @@ export function findAllRoutes(
 export function calculateNextTrainTime(
   lineId: string,
   arrivalAtStationMinutes: number,
-): { boardTime: number; waitTime: number; risk: RiskLevel; riskReason?: string } {
+): { boardTime: number; waitTime: number; risk: RiskLevel; riskReason?: string; lastTrainTime: number; firstTrainTime: number } {
   const timetable = getLineTimetable(lineId);
   if (!timetable) {
     return {
       boardTime: arrivalAtStationMinutes,
       waitTime: 0,
       risk: 'none',
+      lastTrainTime: 24 * 60,
+      firstTrainTime: 0,
     };
   }
 
@@ -406,13 +408,15 @@ export function calculateNextTrainTime(
   const lastTrain = timeStringToMinutes(timetable.lastTrain);
   const headway = timetable.headwayMinutes;
 
-  if (arrivalAtStationMinutes >= lastTrain) {
+  if (arrivalAtStationMinutes > lastTrain) {
     const missedBy = arrivalAtStationMinutes - lastTrain;
     return {
       boardTime: lastTrain,
-      waitTime: 0,
+      waitTime: -missedBy,
       risk: 'missed',
-      riskReason: `到达时已过末班车时间（末班 ${timetable.lastTrain}，晚到 ${missedBy} 分钟）`,
+      riskReason: `末班车 ${timetable.lastTrain} 已发车，晚到 ${missedBy} 分钟`,
+      lastTrainTime: lastTrain,
+      firstTrainTime: firstTrain,
     };
   }
 
@@ -422,13 +426,15 @@ export function calculateNextTrainTime(
     let riskReason: string | undefined;
     if (waitTime > 30) {
       risk = 'warning';
-      riskReason = `距离首班车还有 ${waitTime} 分钟`;
+      riskReason = `距首班车 ${timetable.firstTrain} 还有 ${waitTime} 分钟，需等待`;
     }
     return {
       boardTime: firstTrain,
       waitTime,
       risk,
       riskReason,
+      lastTrainTime: lastTrain,
+      firstTrainTime: firstTrain,
     };
   }
 
@@ -437,11 +443,14 @@ export function calculateNextTrainTime(
   const boardTime = firstTrain + intervals * headway;
 
   if (boardTime > lastTrain) {
+    const missedBy = arrivalAtStationMinutes - lastTrain;
     return {
       boardTime: lastTrain,
-      waitTime: Math.max(0, lastTrain - arrivalAtStationMinutes),
+      waitTime: -Math.max(0, missedBy),
       risk: 'missed',
-      riskReason: `下一班车已超过末班时间（末班 ${timetable.lastTrain}）`,
+      riskReason: `末班 ${timetable.lastTrain} 已发出，下一班已超出运营时间`,
+      lastTrainTime: lastTrain,
+      firstTrainTime: firstTrain,
     };
   }
 
@@ -453,7 +462,7 @@ export function calculateNextTrainTime(
   if (minutesToLast <= 15) {
     if (minutesToLast <= 5) {
       risk = 'danger';
-      riskReason = `末班车前最后一班，赶不上将无车可乘（剩余 ${minutesToLast} 分钟）`;
+      riskReason = `末班 ${timetable.lastTrain} 前最后 ${Math.ceil(minutesToLast / headway)} 班，赶不上将无车可乘`;
     } else {
       risk = 'warning';
       riskReason = `接近末班车时段（距末班 ${minutesToLast} 分钟）`;
@@ -465,6 +474,8 @@ export function calculateNextTrainTime(
     waitTime,
     risk,
     riskReason,
+    lastTrainTime: lastTrain,
+    firstTrainTime: firstTrain,
   };
 }
 
@@ -477,81 +488,106 @@ function mergeRisk(...risks: RiskLevel[]): RiskLevel {
   return maxLevel;
 }
 
-export function analyzeRouteTiming(
+function findSuggestedDeparture(
+  route: RouteResult,
+  originalDeparture: number,
+): { suggestedDeparture: number; reason: string; direction: 'earlier' | 'later' } | null {
+  const firstSeg = route.segments[0];
+  const tt = getLineTimetable(firstSeg?.line ?? '');
+  const firstTrainMin = tt ? timeStringToMinutes(tt.firstTrain) : 6 * 60;
+
+  for (let dep = originalDeparture; dep >= 0; dep -= 5) {
+    const result = analyzeRouteTimingInternal(route, dep, false);
+    if (result.isReachable) {
+      return {
+        suggestedDeparture: dep,
+        reason: `建议在 ${minutesToTimeString(dep)} 前出发，可全程赶上末班车`,
+        direction: 'earlier',
+      };
+    }
+  }
+
+  for (let dep = firstTrainMin; dep <= 24 * 60; dep += 5) {
+    const result = analyzeRouteTimingInternal(route, dep, false);
+    if (result.isReachable) {
+      return {
+        suggestedDeparture: dep,
+        reason: `建议 ${minutesToTimeString(dep)} 后出发，首班车后即可乘车`,
+        direction: 'later',
+      };
+    }
+  }
+
+  return null;
+}
+
+function analyzeRouteTimingInternal(
   route: RouteResult,
   departureMinutes: number,
+  computeSuggestion: boolean,
 ): TimedRouteResult {
   const timedSegments: TimedPathSegment[] = [];
   const timedTransfers: TimedTransferInfo[] = [];
   const missedSegments: number[] = [];
   const missedTransfers: number[] = [];
 
-  let currentTime = departureMinutes;
+  let timeAtPlatform = departureMinutes;
   let overallRisk: RiskLevel = 'none';
   let isReachable = true;
 
   for (let segIdx = 0; segIdx < route.segments.length; segIdx++) {
     const segment = route.segments[segIdx];
-    const line = getLineById(segment.line);
-
-    const { boardTime, waitTime, risk: boardRisk, riskReason: boardReason } = calculateNextTrainTime(
-      segment.line,
-      currentTime,
-    );
 
     if (segIdx > 0) {
       const transferIdx = segIdx - 1;
       if (transferIdx < route.transfers.length) {
         const prevTransfer = route.transfers[transferIdx];
-        const timedTransfer: TimedTransferInfo = {
-          ...prevTransfer,
-          arrivalTime: currentTime - prevTransfer.walkTime,
-          departureTime: currentTime,
-          bufferTime: boardTime - currentTime,
-          risk: boardRisk === 'missed' ? 'missed' : 'none',
-          riskReason: boardRisk === 'missed' ? boardReason : undefined,
-        };
+        const transferArrivalAtPlatform = timeAtPlatform + prevTransfer.walkTime;
 
-        if (timedTransfer.bufferTime < transferConfig.minBufferMinutes && boardRisk !== 'missed') {
-          timedTransfer.risk = 'danger';
-          timedTransfer.riskReason = `换乘缓冲时间不足（仅 ${timedTransfer.bufferTime} 分钟，最少需要 ${transferConfig.minBufferMinutes} 分钟）`;
-        } else if (timedTransfer.bufferTime < transferConfig.defaultBufferMinutes && boardRisk !== 'missed') {
-          timedTransfer.risk = 'warning';
-          timedTransfer.riskReason = `换乘缓冲时间较紧（${timedTransfer.bufferTime} 分钟，建议 ${transferConfig.defaultBufferMinutes} 分钟）`;
+        const nextTrain = calculateNextTrainTime(segment.line, transferArrivalAtPlatform);
+        const bufferTime = nextTrain.boardTime - transferArrivalAtPlatform;
+
+        let transferRisk: RiskLevel = 'none';
+        let transferReason: string | undefined;
+
+        if (nextTrain.risk === 'missed') {
+          transferRisk = 'missed';
+          transferReason = nextTrain.riskReason;
+        } else if (bufferTime < transferConfig.minBufferMinutes) {
+          transferRisk = 'danger';
+          transferReason = `换乘缓冲仅 ${bufferTime} 分钟（最少需 ${transferConfig.minBufferMinutes} 分钟），可能赶不上`;
+        } else if (bufferTime < transferConfig.defaultBufferMinutes) {
+          transferRisk = 'warning';
+          transferReason = `换乘缓冲 ${bufferTime} 分钟（建议 ${transferConfig.defaultBufferMinutes} 分钟），时间较紧`;
         }
 
+        const timedTransfer: TimedTransferInfo = {
+          ...prevTransfer,
+          arrivalTime: timeAtPlatform,
+          departureTime: transferArrivalAtPlatform,
+          bufferTime,
+          risk: transferRisk,
+          riskReason: transferReason,
+        };
+
         timedTransfers.push(timedTransfer);
-        overallRisk = mergeRisk(overallRisk, timedTransfer.risk);
-        if (timedTransfer.risk === 'missed') {
+        overallRisk = mergeRisk(overallRisk, transferRisk);
+        if (transferRisk === 'missed') {
           missedTransfers.push(transferIdx);
           isReachable = false;
         }
+
+        timeAtPlatform = transferArrivalAtPlatform;
       }
     }
+
+    const { boardTime, waitTime, risk: boardRisk, riskReason: boardReason } =
+      calculateNextTrainTime(segment.line, timeAtPlatform);
 
     const arrivalTime = boardTime + segment.travelTime;
 
-    let segmentRisk = boardRisk;
-    let segmentReason = boardReason;
-
-    if (line) {
-      const endIdx = line.stations.indexOf(segment.toStation);
-      const startIdx = line.stations.indexOf(segment.fromStation);
-      const direction = endIdx >= startIdx ? 1 : -1;
-      const terminalStationIdx = direction === 1 ? line.stations.length - 1 : 0;
-      const stationsBeforeTerminal = Math.abs(terminalStationIdx - endIdx);
-      const timetable = getLineTimetable(segment.line);
-
-      if (timetable && stationsBeforeTerminal <= 2 && segmentRisk !== 'missed') {
-        const lastTrain = timeStringToMinutes(timetable.lastTrain);
-        const arrivalAtTerminal = boardTime + Math.abs(terminalStationIdx - startIdx) * 3;
-        if (arrivalAtTerminal > lastTrain) {
-          segmentRisk = 'missed';
-          segmentReason = `乘坐区间超过末班车到达终点站时间（末班 ${timetable.lastTrain}）`;
-          isReachable = false;
-        }
-      }
-    }
+    const segmentRisk = boardRisk;
+    const segmentReason = boardReason;
 
     overallRisk = mergeRisk(overallRisk, segmentRisk);
     if (segmentRisk === 'missed') {
@@ -568,23 +604,23 @@ export function analyzeRouteTiming(
       riskReason: segmentReason,
     });
 
-    currentTime = arrivalTime;
+    timeAtPlatform = arrivalTime;
   }
 
   let alternativeSuggestion: string | undefined;
-  if (!isReachable) {
-    const firstSegment = route.segments[0];
-    const timetable = getLineTimetable(firstSegment?.line ?? '');
-    if (timetable) {
-      alternativeSuggestion = `建议在 ${timetable.firstTrain} 之前出发，或选择更早的交通方式`;
-    }
 
-    if (overallRisk === 'missed' && missedSegments.length === 0 && missedTransfers.length > 0) {
-      alternativeSuggestion = '换乘时间不足，建议选择换乘更少的路线';
+  if (!isReachable && computeSuggestion) {
+    const suggestion = findSuggestedDeparture(route, departureMinutes);
+    if (suggestion) {
+      alternativeSuggestion = suggestion.reason;
+    } else {
+      alternativeSuggestion = '该路线无法在运营时间内完成，请尝试其他策略或交通方式';
     }
+  } else if (isReachable && overallRisk !== 'none') {
+    alternativeSuggestion = '路线可达，但存在风险段，建议预留充足时间';
   }
 
-  const totalTravelTime = currentTime - departureMinutes;
+  const totalTravelTime = timeAtPlatform - departureMinutes;
 
   return {
     ...route,
@@ -592,13 +628,20 @@ export function analyzeRouteTiming(
     transfers: timedTransfers,
     totalTime: totalTravelTime,
     departureTime: departureMinutes,
-    arrivalTime: currentTime,
+    arrivalTime: timeAtPlatform,
     overallRisk,
     missedSegments,
     missedTransfers,
     isReachable,
     alternativeSuggestion,
   };
+}
+
+export function analyzeRouteTiming(
+  route: RouteResult,
+  departureMinutes: number,
+): TimedRouteResult {
+  return analyzeRouteTimingInternal(route, departureMinutes, true);
 }
 
 export function findTimedRoute(
